@@ -4,7 +4,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
-#include <future>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <exception>
@@ -24,30 +24,43 @@ class InputParser {
                 if (token == "--size")
                     token = std::string("-s");
                 else if (token == "-s") {}
-                if (token == "--quantum")
+                else if (token == "--quantum")
                     token = std::string("-q");
                 else if (token == "-q") {}
-                if (token == "--rate-arrived") {
+                else if (token == "--rate-arrived") {
                     token = std::string("-rn");
-                    rates[token] = std::atof(argv[i++]);
+                    float rate = std::atof(argv[i++]);
+                    if (rate < 0)
+                        throw std::bad_alloc();
+                    rates[token] = rate;
                     continue;
                 }
                 else if (token == "-rn") {
-                    rates[token] = std::atof(argv[i++]);
+                    float rate = std::atof(argv[i++]);
+                    if (rate < 0)
+                        throw std::bad_alloc();
+                    rates[token] = rate;
                     continue;
                 }
-                if (token == "--rate-accepted") {
+                else if (token == "--rate-accepted") {
                     token = std::string("-ra");
-                    rates[token] = std::atof(argv[i++]);
+                    float rate = std::atof(argv[i++]);
+                    if (rate < 0)
+                        throw std::bad_alloc();
+                    rates[token] = rate;
                     continue;
                 }
                 else if (token == "-ra") {
-                    rates[token] = std::atof(argv[i++]);
+                    float rate = std::atof(argv[i++]);
+                    if (rate < 0)
+                        throw std::bad_alloc();
+                    rates[token] = rate;
                     continue;
                 }
                 else
-                    throw std::out_of_range("unknown option");
+                    throw std::out_of_range("Unknown option \"" + token + "\"");
                 args[token] = std::atoi(argv[i++]);
+                token.clear();
             }
         }
 
@@ -55,28 +68,28 @@ class InputParser {
             if (args.count("-s"))
                 return args.at("-s");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify size");
         }
 
         time_t quantum(void) const {
             if (args.count("-q"))
                 return args.at("-q");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify quantum");
         }
 
         float rate_new(void) const {
             if (rates.count("-rn"))
                 return rates.at("-rn");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify rate-arrived");
         }
 
         float rate_accepted(void) const {
             if (rates.count("-ra"))
                 return rates.at("-ra");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify rate-accepted");
         }
 };
 
@@ -136,9 +149,7 @@ class ProcessQueue {
             std::lock_guard<std::mutex> lock(mutex);
             if (count >= limit)
                 throw std::overflow_error("queue is full");
-            for (size_t i=count; i>0; i--)
-                q.at(i) = q.at(i-1);
-            q.at(0) = proc;
+            q.insert(q.begin(), proc);
             count++;
         }
 
@@ -153,33 +164,35 @@ class ProcessQueue {
             std::lock_guard<std::mutex> lock(mutex);
             if (count <= 0)
                 throw std::underflow_error("queue is empty");
+            q.pop_back();
             count--;
         }
 
         void pop_arrived(std::vector<Process>& arrived) {
             std::lock_guard<std::recursive_mutex> lock(rmutex);
+            if (q.empty())
+                return;
             int x = -1, y = -1;
             for (size_t i=0; i<count; i++) {
-                if (x > 0 and y > 0)
+                if (x >= 0 and y > 0)
                     break;
                 if (q.at(i).rem_at <= 0 and x < 0)
                     x = i;
-                if (q.at(i).rem_at > 0 and x > 0 and y < 0)
+                if (q.at(i).rem_at > 0 and x >= 0 and y < 0)
                     y = i;
             }
             if (x < 0)
                 return;
             else if (x == 0 and y < 0) {
-                for (size_t i=0; i<count; i++)
-                    arrived.push_back(q.at(i));
+                arrived.insert(arrived.end(), q.begin(), q.end());
+                q.clear();
                 count = 0;
             }
             else {
-                for (size_t i=y; i<count; i++) {
-                    if (i - y + x < y)
-                        arrived.push_back(q.at(i));
-                    q.at(i - y + x) = q.at(i);
-                }
+                std::vector<Process>::iterator it = q.begin();
+                y = (y < 0) ? static_cast<int>(count) : y;
+                arrived.insert(arrived.end(), it + x, it + y);
+                q.erase(it + x, it + y);
                 count -= y - x;
             }
             this->pop_arrived(arrived);
@@ -187,21 +200,26 @@ class ProcessQueue {
 
         void pop_executed(void) {
             std::lock_guard<std::recursive_mutex> lock(rmutex);
+            if (q.empty())
+                return;
             int x = -1, y = -1;
             for (size_t i=0; i<count; i++) {
-                if (x > 0 and y > 0)
+                if (x >= 0 and y > 0)
                     break;
                 if (q.at(i).rem_bt <= 0 and x < 0)
                     x = i;
-                if (q.at(i).rem_bt > 0 and x > 0 and y < 0)
+                if (q.at(i).rem_bt > 0 and x >= 0 and y < 0)
                     y = i;
             }
             if (x < 0)
                 return;
-            else if (x == 0 and y < 0)
+            else if (x == 0 and y < 0) {
+                q.clear();
                 count = 0;
+            }
             else {
                 std::vector<Process>::iterator it = q.begin();
+                y = (y < 0) ? static_cast<int>(count) : y;
                 q.erase(it + x, it + y);
                 count -= y - x;
             }
@@ -223,15 +241,6 @@ class ProcessQueue {
 
         friend void populate_queue(ProcessQueue&);
         friend class SelfishRoundRobin;
-};
-
-class TimedLog {
-    public:
-        const std::string text;
-        const uint32_t pause;
-
-        TimedLog(std::string text, uint32_t pause):
-            text(text), pause(pause) {}
 };
 
 class SelfishRoundRobin {
@@ -265,8 +274,11 @@ class SelfishRoundRobin {
                     break;
                 }
                 std::lock_guard<std::mutex>* lock = source.get_lock();
-                for (Process& proc: source.q)
+                for (Process& proc: source.q) {
                     proc.rem_at--;
+                    if (!proc.rem_at)
+                        std::cout << "PID " << proc.pid << " has arrived\n";
+                }
                 delete lock;
                 source.pop_arrived(arrivals);
                 for (size_t i=arrivals.size(); i>0; i--)
@@ -291,6 +303,7 @@ class SelfishRoundRobin {
                             accepted.push(proc);
                             arrived.q.erase(it);
                             arrived.count--;
+                            std::cout << "PID " << proc.pid << " has been accepted\n";
                         }
                     }
                     catch (const std::overflow_error& exc) {
@@ -303,11 +316,9 @@ class SelfishRoundRobin {
             accepted.wait = false;
         }
 
-        void selfish_round_robin(float ra, std::promise<const std::vector<TimedLog>&>& promise) {
+        void selfish_round_robin(float ra) {
             std::lock_guard<std::mutex> lock(mutex);
-            static std::vector<TimedLog> logs;
             size_t i = 0;
-            std::string log;
 
             accepted.pop_executed();
             while (accepted.size() or accepted.wait) {
@@ -320,28 +331,13 @@ class SelfishRoundRobin {
                 for (Process& proc: accepted.q)
                     proc.priority += ra;
 
-                log = "PID " + std::to_string(proc.pid) + " executed for " + std::to_string(quantum) + " (ms)";
-                logs.push_back(TimedLog(log, quantum));
-                if (!proc.rem_bt) {
-                    log.clear();
-                    log = "PID " + std::to_string(proc.pid) + " has completed executing";
-                    logs.push_back(TimedLog(log, 0));
-                }
-                delete lock;
+                std::cout << "PID " << proc.pid << " executed for " << quantum << " (ms)\n";
+                if (!proc.rem_bt)
+                    std::cout << "PID " << proc.pid << " has completed executing\n";
 
-                log.clear();
+                delete lock;
                 accepted.pop_executed();
                 i = (i > accepted.size() - 1) ? 0 : i + 1;
-            }
-
-            promise.set_value(std::cref(logs));
-        }
-
-        void print_logs(const std::vector<TimedLog>& logs) {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (const TimedLog& log: logs) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(log.pause));
-                std::cout << log.text << std::endl;
             }
         }
 
@@ -351,18 +347,12 @@ class SelfishRoundRobin {
 
         std::thread start(float rn, float ra) {
             return std::thread([this, rn, ra](void) {
-                std::promise<const std::vector<TimedLog>&> promise;
-                std::future<const std::vector<TimedLog>&>  future = promise.get_future();
-
                 std::thread arrival(&SelfishRoundRobin::process_arrival, this);
                 std::thread acceptance(&SelfishRoundRobin::accept_arrived, this, rn);
-                std::thread execution(&SelfishRoundRobin::selfish_round_robin, this, ra, std::ref(promise));
-                std::thread logging(&SelfishRoundRobin::print_logs, this, std::cref(future.get()));
-
+                std::thread execution(&SelfishRoundRobin::selfish_round_robin, this, ra);
                 arrival.join();
                 acceptance.join();
                 execution.join();
-                logging.join();
             });
         }
 };
@@ -414,14 +404,20 @@ int main(int argc, char* argv[]) {
             rn = args.rate_new();
             ra = args.rate_accepted();
         }
+        catch (const std::bad_alloc& exc) {
+            std::cerr << "Invalid value(s) assigned\n";
+            return 1;
+        }
         catch (const std::out_of_range& exc) {
+            if (argc > 1)
+                std::cerr << exc.what() << "\n\n";
             std::cerr << "Usage: " << std::string(argv[0]);
             std::cerr << " <OPTION...>\n\n";
-            std::cerr << "-s, --size\t\tsize of the process queue\n";
-            std::cerr << "-q, --quantum\t\ttime quantum (ms) value for round robin scheduling\n";
+            std::cerr << "-s,  --size\t\tsize of the process queue\n";
+            std::cerr << "-q,  --quantum\t\ttime quantum (ms) value for round robin scheduling\n";
             std::cerr << "-rn, --rate-arrived\tpriority increment rate (/ms) for newly arrived processes\n";
             std::cerr << "-ra, --rate-accepted\tpriority increment rate (/ms) for accepted processes\n";
-            exit(1);
+            return 1;
         }
 
         ProcessQueue waiting(size);
@@ -433,7 +429,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     catch (const std::exception& exc) {
-        std::cerr << exc.what();
-        exit(1);
+        std::cerr << "Exception(s) caught:\n\n";
+        std::cerr << exc.what() << std::endl;
+        return 1;
     }
 }

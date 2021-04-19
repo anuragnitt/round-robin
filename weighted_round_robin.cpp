@@ -4,12 +4,9 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
-#include <future>
+#include <atomic>
+#include <chrono>
 #include <exception>
-
-class ProcessQueue;
-class TimedLog;
-class WeightedRoundRobin;
 
 class InputParser {
     private:
@@ -29,8 +26,9 @@ class InputParser {
                     token = std::string("-q");
                 else if (token == "-q") {}
                 else
-                    throw std::out_of_range("unknown option");
+                    throw std::out_of_range("Unknown option \"" + token + "\"");
                 args[token] = std::atoi(argv[i++]);
+                token.clear();
             }
         }
 
@@ -38,14 +36,14 @@ class InputParser {
             if (args.count("-s"))
                 return args.at("-s");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify size");
         }
 
         time_t quantum(void) const {
             if (args.count("-q"))
                 return args.at("-q");
             else
-                throw std::out_of_range("key out of range");
+                throw std::out_of_range("Specify quantum");
         }
 };
 
@@ -104,9 +102,7 @@ class ProcessQueue {
             std::lock_guard<std::mutex> lock(mutex);
             if (count >= limit)
                 throw std::overflow_error("queue is full");
-            for (size_t i=count; i>0; i--)
-                q.at(i) = q.at(i-1);
-            q.at(0) = proc;
+            q.insert(q.begin(), proc);
             count++;
         }
 
@@ -121,33 +117,35 @@ class ProcessQueue {
             std::lock_guard<std::mutex> lock(mutex);
             if (count <= 0)
                 throw std::underflow_error("queue is empty");
+            q.pop_back();
             count--;
         }
 
         void pop_arrived(std::vector<Process>& arrived) {
             std::lock_guard<std::recursive_mutex> lock(rmutex);
+            if (q.empty())
+                return;
             int x = -1, y = -1;
             for (size_t i=0; i<count; i++) {
-                if (x > 0 and y > 0)
+                if (x >= 0 and y > 0)
                     break;
                 if (q.at(i).rem_at <= 0 and x < 0)
                     x = i;
-                if (q.at(i).rem_at > 0 and x > 0 and y < 0)
+                if (q.at(i).rem_at > 0 and x >= 0 and y < 0)
                     y = i;
             }
             if (x < 0)
                 return;
             else if (x == 0 and y < 0) {
-                for (size_t i=0; i<count; i++)
-                    arrived.push_back(q.at(i));
+                arrived.insert(arrived.end(), q.begin(), q.end());
+                q.clear();
                 count = 0;
             }
             else {
-                for (size_t i=y; i<count; i++) {
-                    if (i - y + x < y)
-                        arrived.push_back(q.at(i));
-                    q.at(i - y + x) = q.at(i);
-                }
+                std::vector<Process>::iterator it = q.begin();
+                y = (y < 0) ? static_cast<int>(count) : y;
+                arrived.insert(arrived.end(), it + x, it + y);
+                q.erase(it + x, it + y);
                 count -= y - x;
             }
             this->pop_arrived(arrived);
@@ -155,21 +153,26 @@ class ProcessQueue {
 
         void pop_executed(void) {
             std::lock_guard<std::recursive_mutex> lock(rmutex);
+            if (q.empty())
+                return;
             int x = -1, y = -1;
             for (size_t i=0; i<count; i++) {
-                if (x > 0 and y > 0)
+                if (x >= 0 and y > 0)
                     break;
                 if (q.at(i).rem_bt <= 0 and x < 0)
                     x = i;
-                if (q.at(i).rem_bt > 0 and x > 0 and y < 0)
+                if (q.at(i).rem_bt > 0 and x >= 0 and y < 0)
                     y = i;
             }
             if (x < 0)
                 return;
-            else if (x == 0 and y < 0)
+            else if (x == 0 and y < 0) {
+                q.clear();
                 count = 0;
+            }
             else {
                 std::vector<Process>::iterator it = q.begin();
+                y = (y < 0) ? static_cast<int>(count) : y;
                 q.erase(it + x, it + y);
                 count -= y - x;
             }
@@ -180,15 +183,6 @@ class ProcessQueue {
         friend class WeightedRoundRobin;
 };
 
-class TimedLog {
-    public:
-        const std::string text;
-        const uint32_t pause;
-
-        TimedLog(std::string text, uint32_t pause):
-            text(text), pause(pause) {}
-};
-
 class WeightedRoundRobin {
     private:
         ProcessQueue& source;
@@ -196,19 +190,25 @@ class WeightedRoundRobin {
         time_t quantum;
         std::mutex mutex;
 
+        std::lock_guard<std::mutex>* get_lock(void) {
+            return new std::lock_guard<std::mutex>(mutex);
+        }
+
         void process_arrival(void) {
-            std::lock_guard<std::mutex> lock(mutex);
             if (!source.limit or !arrived.limit)
                 throw std::logic_error("ProcessQueue(s) have zero capacities");
 
             std::vector<Process> arrivals;
             arrivals.reserve(source.limit);
 
+            std::lock_guard<std::mutex>* lock = this->get_lock();
             source.pop_arrived(arrivals);
             for (size_t i=arrivals.size(); i>0; i--)
                 arrived.push(arrivals.at(i-1));
+            delete lock;
 
             while (true) {
+                std::lock_guard<std::mutex>* source_lock = source.get_lock();
                 arrivals.clear();
                 if (source.size()) {
                     using namespace std::literals::chrono_literals;
@@ -218,26 +218,31 @@ class WeightedRoundRobin {
                     arrived.wait = false;
                     break;
                 }
-                std::lock_guard<std::mutex>* lock = source.get_lock();
-                for (Process& proc: source.q)
+                for (Process& proc: source.q) {
                     proc.rem_at--;
-                delete lock;
+                    if (!proc.rem_at)
+                        std::cout << "PID " << proc.pid << " has arrived\n";
+                }
+                delete source_lock;
+
                 source.pop_arrived(arrivals);
+                std::lock_guard<std::mutex>* lock = this->get_lock();
                 for (size_t i=arrivals.size(); i>0; i--)
                     arrived.push(arrivals.at(i-1));
+                delete lock;
             }
         }
 
-        void weighted_round_robin(std::promise<const std::vector<TimedLog>&>& promise) {
-            std::lock_guard<std::mutex> lock(mutex);
-            static std::vector<TimedLog> logs;
+        void weighted_round_robin(void) {
             size_t i = 0;
             uint32_t time_slice;
-            std::string log;
 
             arrived.pop_executed();
             while (arrived.size() or arrived.wait) {
-                std::lock_guard<std::mutex>* lock = arrived.get_lock();
+                if (!arrived.size())
+                    continue;
+
+                std::lock_guard<std::mutex>* lock = this->get_lock();
                 Process& proc = arrived.q.at(i);
 
                 if (proc.rem_bt >= proc.weight * quantum)
@@ -248,28 +253,13 @@ class WeightedRoundRobin {
                 std::this_thread::sleep_for(std::chrono::milliseconds(time_slice));
                 proc.rem_bt -= time_slice;
 
-                log = "PID " + std::to_string(proc.pid) + " executed for " + std::to_string(time_slice) + " (ms)";
-                logs.push_back(TimedLog(log, time_slice));
-                if (!proc.rem_bt) {
-                    log.clear();
-                    log = "PID " + std::to_string(proc.pid) + " has completed executing";
-                    logs.push_back(TimedLog(log, 0));
-                }
-                delete lock;
+                std::cout << "PID " << proc.pid << " executed for " << time_slice << " (ms)\n";
+                if (!proc.rem_bt)
+                    std::cout << "PID " << proc.pid << " has completed executing\n";
 
-                log.clear();
                 arrived.pop_executed();
-                i = (i > arrived.size() - 1) ? 0 : i + 1;
-            }
-
-            promise.set_value(std::cref(logs));
-        }
-
-        void print_logs(const std::vector<TimedLog>& logs) {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (const TimedLog& log: logs) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(log.pause));
-                std::cout << log.text << std::endl;
+                i = (i >= arrived.size() - 1) ? 0 : i + 1;
+                delete lock;
             }
         }
 
@@ -279,26 +269,13 @@ class WeightedRoundRobin {
 
         std::thread start(void) {
             return std::thread([this](void) {
-                std::promise<const std::vector<TimedLog>&> promise;
-                std::future<const std::vector<TimedLog>&> future = promise.get_future();
-                    
                 std::thread arrival(&WeightedRoundRobin::process_arrival, this);
-                std::thread execution(&WeightedRoundRobin::weighted_round_robin, this, std::ref(promise));
-                std::thread logging(&WeightedRoundRobin::print_logs, this, std::cref(future.get()));
-
+                std::thread execution(&WeightedRoundRobin::weighted_round_robin, this);
                 arrival.join();
                 execution.join();
-                logging.join();
             });
         }
 };
-
-void print_logs(const std::vector<TimedLog>& logs) {
-    for (const TimedLog& log: logs) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(log.pause));
-        std::cout << log.text << std::endl;
-    }
-}
 
 void populate_queue(ProcessQueue& pq) {
     if (!pq.limit)
@@ -328,6 +305,9 @@ void populate_queue(ProcessQueue& pq) {
             std::cin.putback(keystroke);
 
         std::cin >> at >> bt >> weight;
+        if (weight <= 0)
+            throw std::bad_alloc();
+
         pq.push(Process(i, at, bt, weight));
         std::cin.sync();
         count++;
@@ -345,11 +325,13 @@ int main(int argc, char* argv[]) {
             quantum = args.quantum();
         }
         catch (const std::out_of_range& exc) {
+            if (argc > 1)
+                std::cerr << exc.what() << "\n\n";
             std::cerr << "Usage: " << std::string(argv[0]);
             std::cerr << " <OPTION...>\n\n";
             std::cerr << "-s, --size\tsize of the process queue\n";
             std::cerr << "-q, --quantum\ttime quantum (ms) value for round robin scheduling\n";
-            exit(1);
+            return 1;
         }
 
         ProcessQueue waiting(size);
@@ -360,8 +342,13 @@ int main(int argc, char* argv[]) {
         weighted_rr.join();
         return 0;
     }
+    catch (const std::bad_alloc& exc) {
+        std::cerr << "Invalid value(s) assigned\n";
+        return 1;
+    }
     catch (const std::exception& exc) {
+        std::cerr << "Exception(s) caught:\n\n";
         std::cerr << exc.what() << std::endl;
-        exit(1);
+        return 1;
     }
 }
