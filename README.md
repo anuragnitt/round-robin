@@ -4,3 +4,7 @@
 
 *   Weighted Round Robin
 *   Selfish Round Robin
+
+```bash
+g++ -std=c++14 -pthread <file>.cpp -o <file>
+```
