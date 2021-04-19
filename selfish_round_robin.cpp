@@ -127,7 +127,7 @@ class ProcessQueue {
             return new std::lock_guard<std::mutex>(mutex);
         }
 
-        size_t size(void) const {
+        size_t size(void) {
             std::lock_guard<std::mutex> lock(mutex);
             return count;
         }
@@ -208,7 +208,7 @@ class ProcessQueue {
             this->pop_executed();
         }
 
-        float threshold(void) const {
+        float threshold(void) {
             std::lock_guard<std::mutex> lock(mutex);
             if (!count)
                 return 0;
@@ -354,10 +354,10 @@ class SelfishRoundRobin {
                 std::promise<const std::vector<TimedLog>&> promise;
                 std::future<const std::vector<TimedLog>&>  future = promise.get_future();
 
-                std::thread arrival(this->process_arrival);
-                std::thread acceptance(this->accept_arrived, rn);
-                std::thread execution(this->selfish_round_robin, ra, std::ref(promise));
-                std::thread logging(this->print_logs, std::cref(future.get()));
+                std::thread arrival(&SelfishRoundRobin::process_arrival, this);
+                std::thread acceptance(&SelfishRoundRobin::accept_arrived, this, rn);
+                std::thread execution(&SelfishRoundRobin::selfish_round_robin, this, ra, std::ref(promise));
+                std::thread logging(&SelfishRoundRobin::print_logs, this, std::cref(future.get()));
 
                 arrival.join();
                 acceptance.join();
@@ -426,6 +426,7 @@ int main(int argc, char* argv[]) {
 
         ProcessQueue waiting(size);
         populate_queue(waiting);
+
         SelfishRoundRobin srr(std::ref(waiting), quantum);
         std::thread selfish_rr = srr.start(rn, ra);
         selfish_rr.join();

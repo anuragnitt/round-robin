@@ -281,10 +281,10 @@ class WeightedRoundRobin {
             return std::thread([this](void) {
                 std::promise<const std::vector<TimedLog>&> promise;
                 std::future<const std::vector<TimedLog>&> future = promise.get_future();
-                
-                std::thread arrival(this->process_arrival);
-                std::thread execution(this->weighted_round_robin, std::ref(promise));
-                std::thread logging(this->print_logs, std::cref(future.get()));
+                    
+                std::thread arrival(&WeightedRoundRobin::process_arrival, this);
+                std::thread execution(&WeightedRoundRobin::weighted_round_robin, this, std::ref(promise));
+                std::thread logging(&WeightedRoundRobin::print_logs, this, std::cref(future.get()));
 
                 arrival.join();
                 execution.join();
@@ -354,6 +354,7 @@ int main(int argc, char* argv[]) {
 
         ProcessQueue waiting(size);
         populate_queue(waiting);
+
         WeightedRoundRobin wrr(std::ref(waiting), quantum);
         std::thread weighted_rr = wrr.start();
         weighted_rr.join();
